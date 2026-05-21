@@ -3,6 +3,131 @@ import torch
 import triton 
 import triton.language as tl 
 
+@triton.autotune(
+    [
+        triton.Config(
+            {"BLOCK_SIZE_Q": BLOCK_SIZE_Q, "BLOCK_SIZE_KV": BLOCK_SIZE_KV},
+            num_stages=num_stages,
+            num_warps=num_warps,
+        )
+        for BLOCK_SIZE_Q in [64, 128]
+        for BLOCK_SIZE_KV in [32, 64]
+        for num_stages in ([3, 4, 7])
+        for num_warps in [2, 4]
+    ],
+    key=["SEQ_LEN", "HEAD_DIM"],
+)
+@triton.jit 
+def _attn_fwd(
+    Q,
+    K,
+    V,
+    softmax_scale,
+    M,
+    O,
+    stride_Q_batch,
+    stride_Q_head,
+    stride_Q_seq,
+    stride_Q_dim,
+    stride_K_batch,
+    stride_K_head,
+    stride_K_seq,
+    stride_K_dim,
+    stride_V_batch,
+    stride_V_head,
+    stride_V_seq,
+    stride_V_dim,
+    stride_O_batch,
+    stride_O_head,
+    stride_O_seq,
+    stride_O_dim,
+    BATCH_SIZE,
+    NUM_HEADS: tl.constexpr,
+    SEQ_LEN: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_SIZE_Q: tl.constexpr,
+    BLOCK_SIZE_KV: tl.constexpr, 
+    STAGE: tl.constexpr,
+):
+    tl.static_assert(BLOCK_SIZE_KV <= HEAD_DIM)
+
+    block_index_q = tl.program_id(0)
+
+    index_batch_head = tl.program_id(1)
+
+    index_batch = index_batch_head // NUM_HEADS 
+
+    index_head = index_batch_head % NUM_HEADS 
+
+    qvk_offset = (
+        index_batch.to(tl.int64) * stride_Q_batch 
+        + index_head.to(tl.int64) * stride_Q_head 
+    )
+
+    
+
+
+class TritonAttention(torch.autograd.Function):
+
+    @staticmethod 
+    def forward(ctx, Q, K, V, causal, softmax_scale):
+        HEAD_DIM_Q, HEAD_DIM_K = Q.shape[-1], K.shape[-1]
+        HEAD_DIM_V = V.shape[-1]
+
+        BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM = Q.shape 
+
+        assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V 
+
+        O = torch.empty_like(Q)
+        stage = 3 if causal else 1 
+
+        grid = lambda args: (
+            triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]),
+            BATCH_SIZE * NUM_HEADS,
+            1,
+        )
+
+        M = torch.empty(
+            (BATCH_SIZE, NUM_HEADS, SEQ_LEN), device=Q.device, dtype=torch.float32
+        )
+
+        _attn_fwd[grid](
+            Q=Q,
+            K=K,
+            V=V,
+            softmax_scale=softmax_scale,
+            M=M,
+            O=O,
+            stride_Q_batch=Q.stride(0),
+            stride_Q_head=Q.stride(1),
+            stride_Q_seq=Q.stride(2),
+            stride_Q_dim=Q.stride(3),
+            stride_K_batch=K.stride(0),
+            stride_K_head=K.stride(1),
+            stride_K_seq=K.stride(2),
+            stride_K_dim=K.stride(3),
+            stride_V_batch=V.stride(0),
+            stride_V_head=V.stride(1),
+            stride_V_seq=V.stride(2),
+            stride_V_dim=V.stride(3),
+            stride_O_batch=O.stride(0),
+            stride_O_head=O.stride(1),
+            stride_O_seq=O.stride(2),
+            stride_O_dim=O.stride(3),
+            BATCH_SIZE=Q.shape[0],
+            NUM_HEADS=Q.shape[1],
+            SEQ_LEN=Q.shape[2],
+            HEAD_DIM=HEAD_DIM_K,
+            STAGE=stage,
+        )
+
+        ctx.save_for_backward(Q, K, V, O, M)
+        ctx.grid = grid 
+        ctx.softmax_scale = softmax_scale 
+        ctx.HEAD_DIM = HEAD_DIM_K 
+        ctx.causal = causal 
+        return O 
+
 def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float16):
     Q = (
         torch.empty(
